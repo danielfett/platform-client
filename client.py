@@ -24,26 +24,27 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 import argparse
 import json
 import sys
+from base64 import b64decode
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from operator import itemgetter, attrgetter
+from datetime import datetime
+from operator import attrgetter, itemgetter
 from time import sleep
 from typing import Dict, List, Optional, Set, Tuple
-from base64 import b64decode
-from datetime import datetime
 
 import requests
-from rich import box
-from rich.color import Color
-from rich.console import Console
-from rich.progress import Progress
-from rich.console import RenderGroup
-from rich.style import Style
-from rich.table import Table
-from rich.panel import Panel
-from yaml import SafeLoader, load
+import requests_cache
+from config_path import ConfigPath
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
+from rich import box
+from rich.color import Color
+from rich.console import Console, RenderGroup
+from rich.panel import Panel
+from rich.progress import Progress
+from rich.style import Style
+from rich.table import Table
+from yaml import SafeLoader, load
 
 nop = lambda x: x
 
@@ -51,7 +52,7 @@ nop = lambda x: x
 PARALLEL_REQUESTS = 100
 PARALLEL_REQUESTS_PLATFORM = 15
 TIMEOUT = (14, 14)
-
+CACHE_LIFETIME = 300
 
 console = Console()
 
@@ -198,8 +199,11 @@ class Dataset:
             yield from self.rows
         else:
             for row in self.rows:
-                if eval(self.where, {}, row):
-                    yield row
+                try:
+                    if eval(self.where, {}, row):
+                        yield row
+                except TypeError:
+                    pass
 
     @classmethod
     def get(cls, api, args):
@@ -236,7 +240,9 @@ class JWKS(CustomType):
     def __init__(self, jwks):
         self.raw = jwks
         self.certs = [self._read_certificate(c["x5c"][0]) for c in jwks["keys"]]
-        self.min_not_valid_after = max(self.certs, key=attrgetter("not_valid_after")).not_valid_after
+        self.min_not_valid_after = max(
+            self.certs, key=attrgetter("not_valid_after")
+        ).not_valid_after
         self.lifetime_days = (self.min_not_valid_after - datetime.now()).days
 
     def _read_certificate(self, pem):
@@ -248,11 +254,15 @@ class JWKS(CustomType):
         for c in self.certs:
             try:
                 if (c.not_valid_after - datetime.now()).days < 100:
-                    color = 'red'
+                    color = "red"
                 else:
-                    color = 'green'
+                    color = "green"
 
-                out.renderables.append(Panel(f"{c.subject.rfc4514_string()}\n[{color}]valid until {c.not_valid_after}[/{color}]"))
+                out.renderables.append(
+                    Panel(
+                        f"{c.subject.rfc4514_string()}\n[{color}]valid until {c.not_valid_after}[/{color}]"
+                    )
+                )
             except Exception as e:
                 out.renderables.append(Panel(f"[red](unable to decode: {e})[/red]"))
         return out
@@ -334,7 +344,7 @@ def update_and_remap_keys(existing_dict, prefix, dct):
 
 
 def fetch_and_store_issuer(out_data, _, idp):
-    ERROR_CONST = "OIDC_ERROR"
+    ERROR_CONST = "__oidc_error"
     config_url = f"{idp['iss']}/.well-known/openid-configuration"
     try:
         config_file = requests.get(
@@ -355,7 +365,7 @@ def fetch_and_store_issuer(out_data, _, idp):
 
 
 def fetch_and_store_bank(out_data, api, idp):
-    ERROR_CONST = "BANK_ERROR"
+    ERROR_CONST = "__bank_error"
     try:
         bank_information = api.get("banks", {"term": idp["bics"][0], "limit": 1})[0]
         update_and_remap_keys(idp, "bank", bank_information)
@@ -365,16 +375,16 @@ def fetch_and_store_bank(out_data, api, idp):
         out_data.append(idp)
 
 
-def output_json_lines(data: Dataset, formatter=None):
+def output_json_lines(data: Dataset, formatter, cache_disabled):
     for el in data.get_rows(False, sort=False):
         print(json.dumps(el))
 
 
-def output_json_list(data: Dataset, formatter=None):
+def output_json_list(data: Dataset, formatter, cache_disabled):
     print(json.dumps(list(data.get_rows(False, sort=False))))
 
 
-def output_rich(data: Dataset, formatter=nice_formatter):
+def output_rich(data: Dataset, formatter, cache_disabled):
     console.record = True
     table = Table(
         show_header=True,
@@ -408,6 +418,8 @@ def output_rich(data: Dataset, formatter=nice_formatter):
             f"`[blue]{data.where}[/blue]`",
             f"→ {table.row_count} rows of {data.original_row_count} available rows shown.",
         )
+    if not cache_disabled:
+        console.print("[green]Caching enabled. To disable, use[/green] --no-cache")
 
 
 def filter_only(fields, expr):
@@ -416,14 +428,22 @@ def filter_only(fields, expr):
 
 
 FORMAT_OPTS = {
-    "json-lines": output_json_lines,
-    "json-list": output_json_list,
-    "table": output_rich,
+    "json-lines": {"function": output_json_lines, "disable_cache": True},
+    "json-list": {"function": output_json_list, "disable_cache": True},
+    "table": {"function": output_rich, "disable_cache": False},
 }
 
 if __name__ == "__main__":
+    configpath = ConfigPath("yes", "platform-client", "")
+    requests_cache.core.install_cache(
+        cache_name=str(configpath.saveFilePath(mkdir=True)),
+        fast_save=True,
+        expire_after=CACHE_LIFETIME,
+    )
+
     parser = argparse.ArgumentParser()
     parser.add_argument("credentials_file", type=argparse.FileType("r"))
+
     subparsers = parser.add_subparsers()
 
     create_subparsers = [
@@ -438,6 +458,13 @@ if __name__ == "__main__":
     for sp_name, sp_func in create_subparsers:
         p = subparsers.add_parser(sp_name)
         p.set_defaults(func=sp_func.get)
+
+        p.add_argument(
+            "--no-cache",
+            "-n",
+            action="store_true",
+            help=f"Disable caching. By default, all requests are cached for {CACHE_LIFETIME} seconds.",
+        )
 
         p.add_argument(
             "--with",
@@ -496,6 +523,10 @@ if __name__ == "__main__":
     if args.where:
         compile(args.where, "provided where expression", "eval")
 
+    no_cache = args.no_cache or FORMAT_OPTS[args.format]["disable_cache"]
+    if no_cache:
+        requests_cache.core.clear()
+
     with console.status("Connecting to yes® platform ...") as status:
         api = YesPlatformAPI(**load(args.credentials_file.read(), Loader=SafeLoader))
     data: Dataset = args.func(api, args)
@@ -512,9 +543,13 @@ if __name__ == "__main__":
         data.where = args.where
     elif args.all_rows:
         data.where = None
-    FORMAT_OPTS[args.format](
-        data, formatter=(string_formatter if args.raw else nice_formatter)
+    FORMAT_OPTS[args.format]["function"](
+        data,
+        formatter=(string_formatter if args.raw else nice_formatter),
+        cache_disabled=no_cache,
     )
     if args.export:
         console.save_html(args.export)
         console.print(f"[red]Output exported to {args.export}.")
+
+    requests_cache.core.remove_expired_responses()

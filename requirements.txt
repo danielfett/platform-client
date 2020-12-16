@@ -1,3 +1,5 @@
 rich
 requests
 pyyaml
+requests_cache
+config_path
