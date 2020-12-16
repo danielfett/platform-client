@@ -43,6 +43,7 @@ nop = lambda x: x
 
 
 PARALLEL_REQUESTS = 100
+PARALLEL_REQUESTS_PLATFORM = 15
 TIMEOUT = (14, 14)
 
 
@@ -56,12 +57,14 @@ class YesPlatformAPI:
             "idps": "https://api.sandbox.yes.com/idps/v1/",
             "rps": "https://api.sandbox.yes.com/rps/v1/",
             "sps": "https://api.sandbox.yes.com/sps/v1/",
+            "banks": "https://api.sandbox.yes.com/banks/v1/",
         },
         "production": {
             "token_endpoint": "https://as.yes.com/token",
             "idps": "https://api.yes.com/idps/v1/",
             "rps": "https://api.yes.com/rps/v1/",
             "sps": "https://api.yes.com/sps/v1/",
+            "banks": "https://api.yes.com/banks/v1/",
         },
     }
 
@@ -83,9 +86,10 @@ class YesPlatformAPI:
         ).json()
         self.access_token = resp["access_token"]
 
-    def get(self, endpoint):
+    def get(self, endpoint, params={}):
         req = requests.get(
             self.urls[endpoint],
+            params=params,
             headers={"Authorization": f"Bearer {self.access_token}"},
             cert=self.cert_pair,
             timeout=TIMEOUT,
@@ -170,6 +174,26 @@ class Dataset:
         return cls(rows)
 
 
+def retrieve_auxilliary_data_parallel(
+    api, dataset: Dataset, parallel_requests, update_fn, new_dataset_class, status_text
+):
+    orig_data = dataset.rows
+    data = []
+
+    def progress_bar():
+        with Progress() as progress:
+            task = progress.add_task(status_text, total=len(orig_data))
+            while len(data) < len(orig_data):
+                progress.update(task, completed=len(data))
+                sleep(0.1)
+
+    with ThreadPoolExecutor(max_workers=parallel_requests) as executor:
+        executor.submit(progress_bar)
+        executor.map(lambda x: update_fn(data, api, x), orig_data)
+
+    return new_dataset_class(data)
+
+
 class IDPDataset(Dataset):
     output_columns = ("id", "iss", "bics", "owner_id")
     sort = ("bics",)
@@ -177,28 +201,48 @@ class IDPDataset(Dataset):
     STANDARD_API = "idps"
 
 
+class IDPBankDataset(IDPDataset):
+    output_columns = ("id", "iss", "name")
+
+    @classmethod
+    def get(cls, api, args):
+        iss_dataset = super().get(api, args)
+        return retrieve_auxilliary_data_parallel(
+            api,
+            iss_dataset,
+            PARALLEL_REQUESTS_PLATFORM,
+            fetch_and_store_bank,
+            cls,
+            "Fetching bank information",
+        )
+
+
 class IDPIssuerDataset(IDPDataset):
     @classmethod
     def get(cls, api, args):
-        with console.status("Retrieving list of issuers ..."):
-            idps = api.get(cls.STANDARD_API)
-        data = []
+        iss_dataset = super().get(api, args)
+        return retrieve_auxilliary_data_parallel(
+            api,
+            iss_dataset,
+            PARALLEL_REQUESTS,
+            fetch_and_store_issuer,
+            cls,
+            "Fetching OIDC configuration files",
+        )
 
-        def progress_bar():
-            with Progress() as progress:
-                task = progress.add_task(
-                    "Fetching OIDC configuration files", total=len(idps)
-                )
-                while len(data) < len(idps):
-                    progress.update(task, completed=len(data))
-                    sleep(0.1)
 
-        with ThreadPoolExecutor(max_workers=PARALLEL_REQUESTS) as executor:
-            executor.submit(progress_bar)
-            executor.map(lambda x: fetch_and_store_issuer(data, x), idps)
-
-        ds = cls(idps)
-        return ds
+class IDPIssuerBankDataset(IDPBankDataset):
+    @classmethod
+    def get(cls, api, args):
+        iss_dataset = super().get(api, args)
+        return retrieve_auxilliary_data_parallel(
+            api,
+            iss_dataset,
+            PARALLEL_REQUESTS,
+            fetch_and_store_issuer,
+            cls,
+            "Fetching OIDC configuration files",
+        )
 
 
 class RPDataset(Dataset):
@@ -215,16 +259,29 @@ class SPDataset(Dataset):
     STANDARD_API = "sps"
 
 
+def update_and_remap_keys(existing_dict, prefix, dct):
+    for key, value in dct.items():
+        if key in existing_dict:
+            existing_dict[f"{prefix}__{key}"] = value
+        else:
+            existing_dict[key] = value
+
+
 def nice_formatter(inval):
-    if type(inval) == list:
-        return ", ".join(inval)
+    if inval is None:
+        return ""
+    elif type(inval) == list:
+        return "[light_sky_blue1],[/light_sky_blue1] ".join(inval)
     else:
         return str(inval)
+
 
 def raw_formatter(inval):
     return str(inval)
 
-def fetch_and_store_issuer(out_data, idp):
+
+def fetch_and_store_issuer(out_data, _, idp):
+    ERROR_CONST = "OIDC_ERROR"
     config_url = f"{idp['iss']}/.well-known/openid-configuration"
     try:
         config_file = requests.get(
@@ -232,15 +289,25 @@ def fetch_and_store_issuer(out_data, idp):
             timeout=TIMEOUT,
         ).json()
     except requests.exceptions.ConnectionError:
-        idp["ERROR"] = "Failed to connect."
+        idp[ERROR_CONST] = "Failed to connect."
     except json.decoder.JSONDecodeError:
-        idp["ERROR"] = "Failed to parse OIDC config."
+        idp[ERROR_CONST] = "Failed to parse OIDC config."
     except Exception as e:
-        print(e)
-        idp["ERROR"] = repr(e)
+        idp[ERROR_CONST] = repr(e)
     else:
-        idp["ERROR"] = None
-        idp.update(config_file)
+        idp[ERROR_CONST] = None
+        update_and_remap_keys(idp, "oidc", config_file)
+    finally:
+        out_data.append(idp)
+
+
+def fetch_and_store_bank(out_data, api, idp):
+    ERROR_CONST = "BANK_ERROR"
+    try:
+        bank_information = api.get("banks", {"term": idp["bics"][0], "limit": 1})[0]
+        update_and_remap_keys(idp, "bank", bank_information)
+    except Exception as e:
+        idp[ERROR_CONST] = e
     finally:
         out_data.append(idp)
 
@@ -255,6 +322,7 @@ def output_json_list(data: Dataset, formatter=None):
 
 
 def output_rich(data: Dataset, formatter=nice_formatter):
+    console.record = True
     table = Table(
         show_header=True,
         header_style="bold blue",
@@ -269,6 +337,7 @@ def output_rich(data: Dataset, formatter=nice_formatter):
         table.add_row(*row)
 
     console.print(table)
+    console.rule("Information")
 
     if len(data.output_columns) < len(data.available_columns):
         console.print(
@@ -306,7 +375,9 @@ if __name__ == "__main__":
 
     create_subparsers = [
         ("idps", IDPDataset),
-        ("idps_oidc", IDPIssuerDataset),
+        ("idps+oidc", IDPIssuerDataset),
+        ("idps+banks", IDPBankDataset),
+        ("idps+banks+oidc", IDPIssuerBankDataset),
         ("rps", RPDataset),
         ("sps", SPDataset),
     ]
@@ -338,6 +409,12 @@ if __name__ == "__main__":
             choices=FORMAT_OPTS.keys(),
             default="table",
             help="Define the output format.",
+        )
+        p.add_argument(
+            "--export",
+            "-e",
+            type=str,
+            help="Export to HTML file.",
         )
         p.add_argument(
             "--sort",
@@ -382,4 +459,9 @@ if __name__ == "__main__":
         data.where = args.where
     elif args.all_rows:
         data.where = None
-    FORMAT_OPTS[args.format](data, formatter=(raw_formatter if args.raw else nice_formatter))
+    FORMAT_OPTS[args.format](
+        data, formatter=(raw_formatter if args.raw else nice_formatter)
+    )
+    if args.export:
+        console.save_html(args.export)
+        console.print(f"[red]Output exported to {args.export}.")

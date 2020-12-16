@@ -23,7 +23,7 @@ See [credentials.example.yml](credentials.example.yml) for an example.
 
 ## Usage
 
-List all issuers (`idps`), relying parties (`rps`), service providers (`sps`), or issuers with their OpenID Connect configurations (`idps_oidc`):
+List all issuers (`idps`), relying parties (`rps`), service providers (`sps`):
 
 ```bash
 $ ./client.py sandbox.yml idps
@@ -42,7 +42,8 @@ Filter active: `status=='active'` → 54 rows of 54 available rows shown.
 ```
 **Note:** Default settings for columns, sorting, and filtering are applied. 
 
-**Note:** `idps_oidc` retrieves the issuer files for all IDPs and therefore takes a few moments to complete. When an issuer file cannot be retrieved, the special column `ERROR` contains an error message describing the nature of the error.
+### Combining Datasets
+The list of issuers (`idps`) can be combined with bank information (`+banks`) and/or with the information retrievable from the OpenID Connect configuration files. Valid combinations: `idps+banks`, `idps+oidc`, and `idps+banks+oidc`. Fields that occur in multiple datasets are prefixed with `bank__` and `oidc__`, respectively. When an issuer file or bank information cannot be retrieved, the special columns `OIDC_ERROR` and `BANK_ERROR` contains the respective error messages. 
 
 ### Show/Hide Columns
 
