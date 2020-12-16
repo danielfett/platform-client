@@ -26,18 +26,24 @@ import json
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from operator import itemgetter
+from operator import itemgetter, attrgetter
 from time import sleep
 from typing import Dict, List, Optional, Set, Tuple
+from base64 import b64decode
+from datetime import datetime
 
 import requests
 from rich import box
 from rich.color import Color
 from rich.console import Console
 from rich.progress import Progress
+from rich.console import RenderGroup
 from rich.style import Style
 from rich.table import Table
+from rich.panel import Panel
 from yaml import SafeLoader, load
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
 
 nop = lambda x: x
 
@@ -97,6 +103,27 @@ class YesPlatformAPI:
         return req.json()
 
 
+def nice_formatter(inval):
+    if inval is None:
+        return ""
+    elif isinstance(inval, CustomType):
+        return inval.get_rich()
+    elif type(inval) == list:
+        return "[light_sky_blue1],[/light_sky_blue1] ".join(inval)
+    else:
+        return str(inval)
+
+
+def raw_formatter(inval):
+    if isinstance(inval, CustomType):
+        return inval.raw
+    return inval
+
+
+def string_formatter(inval):
+    return str(raw_formatter(inval))
+
+
 class Dataset:
     rows: List[Dict]
     output_columns: Optional = None
@@ -104,6 +131,7 @@ class Dataset:
     sort: Optional[Set] = None
     where: Optional[str] = None
     original_row_count: int = 0
+    custom_types: Dict = {}
 
     STANDARD_API: Optional[str] = None
 
@@ -122,6 +150,12 @@ class Dataset:
             for f in self.available_columns:
                 if not f in row:
                     row[f] = None
+                else:
+                    if (
+                        f in self.custom_types
+                        and not type(row[f]) == self.custom_types[f]
+                    ):
+                        row[f] = self.custom_types[f](row[f])
 
     def limit_columns_to(self, columns):
         limit_columns = set(columns.split(","))
@@ -137,7 +171,7 @@ class Dataset:
     def set_sort(self, columns):
         self.sort = tuple(columns.split(","))
 
-    def get_rows(self, fill_blanks, blank="", formatter=nop, sort=True):
+    def get_rows(self, fill_blanks, blank="", formatter=raw_formatter, sort=True):
         self._sort()
         for row in self._where():
             out = {}
@@ -150,7 +184,7 @@ class Dataset:
                     pass
             yield out
 
-    def get_rows_list(self, blank="", formatter=nop):
+    def get_rows_list(self, blank="", formatter=raw_formatter):
         self._sort()
         for row in self._where():
             yield [formatter(row.get(col, blank)) for col in self.output_columns]
@@ -192,6 +226,36 @@ def retrieve_auxilliary_data_parallel(
         executor.map(lambda x: update_fn(data, api, x), orig_data)
 
     return new_dataset_class(data)
+
+
+class CustomType:
+    pass
+
+
+class JWKS(CustomType):
+    def __init__(self, jwks):
+        self.raw = jwks
+        self.certs = [self._read_certificate(c["x5c"][0]) for c in jwks["keys"]]
+        self.min_not_valid_after = max(self.certs, key=attrgetter("not_valid_after")).not_valid_after
+        self.lifetime_days = (self.min_not_valid_after - datetime.now()).days
+
+    def _read_certificate(self, pem):
+        return x509.load_der_x509_certificate(b64decode(pem), default_backend())
+
+    def get_rich(self):
+        out = RenderGroup()
+
+        for c in self.certs:
+            try:
+                if (c.not_valid_after - datetime.now()).days < 100:
+                    color = 'red'
+                else:
+                    color = 'green'
+
+                out.renderables.append(Panel(f"{c.subject.rfc4514_string()}\n[{color}]valid until {c.not_valid_after}[/{color}]"))
+            except Exception as e:
+                out.renderables.append(Panel(f"[red](unable to decode: {e})[/red]"))
+        return out
 
 
 class IDPDataset(Dataset):
@@ -249,6 +313,7 @@ class RPDataset(Dataset):
     output_columns = ("client_id", "client_name")
     sort = ("client_id",)
     where = "status=='active'"
+    custom_types = {"jwks": JWKS}
     STANDARD_API = "rps"
 
 
@@ -256,6 +321,7 @@ class SPDataset(Dataset):
     output_columns = ("client_id", "client_name")
     sort = ("client_id",)
     where = "status=='active'"
+    custom_types = {"jwks": JWKS}
     STANDARD_API = "sps"
 
 
@@ -265,19 +331,6 @@ def update_and_remap_keys(existing_dict, prefix, dct):
             existing_dict[f"{prefix}__{key}"] = value
         else:
             existing_dict[key] = value
-
-
-def nice_formatter(inval):
-    if inval is None:
-        return ""
-    elif type(inval) == list:
-        return "[light_sky_blue1],[/light_sky_blue1] ".join(inval)
-    else:
-        return str(inval)
-
-
-def raw_formatter(inval):
-    return str(inval)
 
 
 def fetch_and_store_issuer(out_data, _, idp):
@@ -460,7 +513,7 @@ if __name__ == "__main__":
     elif args.all_rows:
         data.where = None
     FORMAT_OPTS[args.format](
-        data, formatter=(raw_formatter if args.raw else nice_formatter)
+        data, formatter=(string_formatter if args.raw else nice_formatter)
     )
     if args.export:
         console.save_html(args.export)

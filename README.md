@@ -45,6 +45,7 @@ Filter active: `status=='active'` → 54 rows of 54 available rows shown.
 ### Combining Datasets
 The list of issuers (`idps`) can be combined with bank information (`+banks`) and/or with the information retrievable from the OpenID Connect configuration files. Valid combinations: `idps+banks`, `idps+oidc`, and `idps+banks+oidc`. Fields that occur in multiple datasets are prefixed with `bank__` and `oidc__`, respectively. When an issuer file or bank information cannot be retrieved, the special columns `OIDC_ERROR` and `BANK_ERROR` contains the respective error messages. 
 
+
 ### Show/Hide Columns
 
 Add more colums/fields to the output (see list of additionally available columns below the table above):
@@ -80,13 +81,19 @@ $ ./client.py sandbox.yml idps --where <condition>
  * IDPs where the ID starts with 'ff': \
     `$ ./client.py sandbox.yml idps --where 'id.startswith("ff")'`
  * Issuer information where an authorization endpoint is available: \
-    `$ ./client.py sandbox.yml idps_oidc --where 'authorization_endpoint'`
+    `$ ./client.py sandbox.yml idps+oidc --where 'authorization_endpoint'`
  * Service providers supporting a particular conformance level: \
     `$ ./client.py sandbox.yml sps --with conformance_levels_supported --where '"AdES-B-LT" in conformance_levels_supported'`
 
 (Note: `--where` conditions operate on the raw data. Some columns, like `conformance_levels_supported` are lists and are by default converted to more readable strings for output. Use `--raw` to see the data structures in the table output.)
 
-## JSON Export
+Certificates stored in the `jwks` property of RPs and SPs have a special property `jwks.lifetime_days` that represents the lifetime of the certificate in the JWKS that expires the earliest. This can be used for filtering RPs and SPs with certificates expiring soon:
+
+```bash
+$ ./client.py sandbox.yml rps --with jwks --where 'jwks.lifetime_days < 100'
+```
+
+## JSON Dumping
 Use `--format` to control the output of data:
 
 * `--format json-list` outputs all rows as one JSON list of objects, each object representing a data row. 
@@ -94,8 +101,11 @@ Use `--format` to control the output of data:
 
 Example: Show all authorization endpoint URLs.
 ```bash
-$ ./client.py sandbox.yml idps_oidc --only authorization_endpoint -f json-lines --where 'authorization_endpoint'
+$ ./client.py sandbox.yml idps+oidc --only authorization_endpoint -f json-lines --where 'authorization_endpoint'
 {"authorization_endpoint": "https://example.com/oidc/auth"}
 {"authorization_endpoint": "https://idp.other.example/yes"}
 ...
 ```
+## HTML Export
+Use `--export <filename>` to render the results to an HTML file.
+
