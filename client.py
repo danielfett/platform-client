@@ -227,7 +227,7 @@ class Dataset:
 
     @classmethod
     def get(cls, api, args):
-        with console.status("Retrieving list ..."):
+        with console.status(f"Retrieving list ({cls.CLI_IDENTIFIER})..."):
             rows = api.get(cls.STANDARD_API)
 
         data = cls(rows)
@@ -327,6 +327,8 @@ class CustomType:
 
 
 class JWKSCustomType(CustomType):
+    RED_THRESHOLD_DAYS = 30
+
     def __init__(self, jwks):
         self.raw = jwks
         self.certs = [self._read_certificate(c["x5c"][0]) for c in jwks["keys"]]
@@ -343,7 +345,7 @@ class JWKSCustomType(CustomType):
 
         for c in self.certs:
             try:
-                if (c.not_valid_after - datetime.now()).days < 100:
+                if (c.not_valid_after - datetime.now()).days < self.RED_THRESHOLD_DAYS:
                     color = "red"
                 else:
                     color = "green"
@@ -464,7 +466,7 @@ class MRDataset(Dataset):
 
     STANDARD_API = "mrs"
     CLI_IDENTIFIER = "mrs"
-    RECURSION_LIMIT = 10
+    RECURSION_LIMIT = 20
     DATE_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
     @classmethod
@@ -492,9 +494,9 @@ class MRDataset(Dataset):
         else:
             to_ = datetime.now()
 
-        tracker = {'total_requests': 1, 'completed_requests': 0}
+        tracker = {"total_requests": 1, "completed_requests": 0}
         try:
-            with console.status("Retrieving list ..."):
+            with console.status(f"Retrieving list ({cls.CLI_IDENTIFIER})..."):
                 rows = list(cls._get_from_to(api, from_, to_, tracker))
         except TooManyResultsException:
             console.print(
@@ -502,14 +504,26 @@ class MRDataset(Dataset):
             )
             sys.exit(1)
 
+        with console.status(f"Retrieving list ({RPDataset.CLI_IDENTIFIER})..."):
+            rp_data = api.get(RPDataset.STANDARD_API)
+
+        rp_data_by_client_id = {row["client_id"]: row for row in rp_data}
+
         data = cls(rows)
+        for row in data.rows:
+            try:
+                rp_entry = rp_data_by_client_id[row["client_id"]]
+            except KeyError:
+                rp_entry = {"__client_error": "Client ID not found."}
+            update_and_remap_keys(row, "client", rp_entry)
+        data = cls(data.rows)
         data.handle_args(args)
         return data
 
     @classmethod
     def _get_from_to(cls, api, from_: datetime, to_: datetime, tracker):
         assert from_ < to_
-        if tracker['total_requests'] > cls.RECURSION_LIMIT:
+        if tracker["total_requests"] > cls.RECURSION_LIMIT:
             raise TooManyResultsException()
 
         try:
@@ -520,18 +534,14 @@ class MRDataset(Dataset):
                     "to": to_.strftime(cls.DATE_FORMAT),
                 },
             )
-            tracker['completed_requests'] += 1
+            tracker["completed_requests"] += 1
         except TooManyResultsException:
-            middle = from_ + (to_ - from_)/2
-            print (f"Recursing ({from_} → {middle} → {to_})")
-            tracker['total_requests'] += 1
-            yield from cls._get_from_to(
-                api, from_, middle, tracker
-            )
-            tracker['total_requests'] += 1
-            yield from cls._get_from_to(
-                api, middle, to_, tracker
-            )
+            middle = from_ + (to_ - from_) / 2
+            print(f"Recursing ({from_} → {middle} → {to_})")
+            tracker["total_requests"] += 1
+            yield from cls._get_from_to(api, from_, middle, tracker)
+            tracker["total_requests"] += 1
+            yield from cls._get_from_to(api, middle, to_, tracker)
 
 
 def update_and_remap_keys(existing_dict, prefix, dct):

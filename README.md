@@ -21,9 +21,29 @@ environment: sandbox  # or "production"
 
 See [credentials.example.yml](credentials.example.yml) for an example.
 
-## Usage
+## Common Use Cases
 
-List all issuers (`idps`), relying parties (`rps`), service providers (`sps`):
+ * Show all active RPs:  \
+    `$ ./client.py sandbox.yml rps --where 'status=="inactive"'`
+ * Show RPs containing 'test' in their name: \
+    `$ ./client.py sandbox.yml rps --where '"test" in client_name.lower()'`
+ * Show Mediation Records of clients with 'General' in their name: \
+    `$ ./client.py sandbox.yml mrs --where  '"General" in client_name' --from "1 days ago" --with client_id,requested_claims`
+ * Show clients with certificates expiring soon: \
+    `$ ./client.py sandbox.yml rps --with jwks --where 'jwks.lifetime_days < 100'`
+ * List all authorization endpoints as JSON: \
+    `$ ./client.py sandbox.yml --format json-lines idps+oidc --only authorization_endpoint --where 'authorization_endpoint'`
+ * Show IDPs where the ID starts with 'ff': \
+    `$ ./client.py sandbox.yml idps --where 'id.startswith("ff")'`
+ * Show issuer information where an authorization endpoint is available: \
+    `$ ./client.py sandbox.yml idps+oidc --where 'authorization_endpoint'`
+ * Show service providers supporting a particular conformance level: \
+    `$ ./client.py sandbox.yml sps --with conformance_levels_supported --where '"AdES-B-LT" in conformance_levels_supported'`
+
+
+## Usage Details
+
+List all issuers (`idps`), relying parties (`rps`), service providers (`sps`), or mediation records (`mrs`):
 
 ```bash
 $ ./client.py sandbox.yml idps
@@ -43,7 +63,7 @@ Filter active: `status=='active'` → 54 rows of 54 available rows shown.
 **Note:** Default settings for columns, sorting, and filtering are applied. 
 
 ### Combining Datasets
-The list of issuers (`idps`) can be combined with bank information (`+banks`) and/or with the information retrievable from the OpenID Connect configuration files. Valid combinations: `idps+banks`, `idps+oidc`, and `idps+banks+oidc`. Fields that occur in multiple datasets are prefixed with `bank__` and `oidc__`, respectively. When an issuer file or bank information cannot be retrieved, the special columns `__oidc_error` and `__bank_error` contains the respective error messages. 
+The list of issuers (`idps`) can be combined with bank information (`+banks`) and/or with the information retrievable from the OpenID Connect configuration files. Valid combinations: `idps+banks`, `idps+oidc`, and `idps+banks+oidc`. Fields that occur in multiple datasets are prefixed with `bank__` and `oidc__`, respectively. When an issuer file or bank information cannot be retrieved, the special columns `__oidc_error` and `__bank_error` contains the respective error messages. `mrs` always combines the records with client information.
 
 
 ### Show/Hide Columns
@@ -72,26 +92,11 @@ Limit output by providing a condition:
 ```bash
 $ ./client.py sandbox.yml idps --where <condition>
 ```
-`<condition>` must be a valid python expression. Fields are available as local variables. Examples:
+`<condition>` must be a valid python expression. Fields are available as local variables. 
 
- * Only active RPs:  \
-    `$ ./client.py sandbox.yml rps --where 'status=="inactive"'`
- * RPs containing 'test' in their name: \
-    `$ ./client.py sandbox.yml rps --where '"test" in client_name.lower()'`
- * IDPs where the ID starts with 'ff': \
-    `$ ./client.py sandbox.yml idps --where 'id.startswith("ff")'`
- * Issuer information where an authorization endpoint is available: \
-    `$ ./client.py sandbox.yml idps+oidc --where 'authorization_endpoint'`
- * Service providers supporting a particular conformance level: \
-    `$ ./client.py sandbox.yml sps --with conformance_levels_supported --where '"AdES-B-LT" in conformance_levels_supported'`
+Note: `--where` conditions operate on the raw data. Some columns, like `conformance_levels_supported` are lists and are by default converted to more readable strings for output. Use `--raw` to see the data structures in the table output.
 
-(Note: `--where` conditions operate on the raw data. Some columns, like `conformance_levels_supported` are lists and are by default converted to more readable strings for output. Use `--raw` to see the data structures in the table output.)
-
-Certificates stored in the `jwks` property of RPs and SPs have a special property `jwks.lifetime_days` that represents the lifetime of the certificate in the JWKS that expires the earliest. This can be used for filtering RPs and SPs with certificates expiring soon:
-
-```bash
-$ ./client.py sandbox.yml rps --with jwks --where 'jwks.lifetime_days < 100'
-```
+Certificates stored in the `jwks` property of RPs and SPs have a special property `jwks.lifetime_days` that represents the lifetime of the certificate in the JWKS that expires the earliest. This can be used for filtering RPs and SPs with certificates expiring soon, as shown in the use case above.
 
 ## JSON Dumping
 Use `--format` to control the output of data:
@@ -101,7 +106,7 @@ Use `--format` to control the output of data:
 
 Example: Show all authorization endpoint URLs.
 ```bash
-$ ./client.py sandbox.yml idps+oidc --only authorization_endpoint -f json-lines --where 'authorization_endpoint'
+$ ./client.py sandbox.yml --format json-lines idps+oidc --only authorization_endpoint --where 'authorization_endpoint'
 {"authorization_endpoint": "https://example.com/oidc/auth"}
 {"authorization_endpoint": "https://idp.other.example/yes"}
 ...
