@@ -31,7 +31,9 @@ from datetime import datetime
 from operator import attrgetter, itemgetter
 from time import sleep
 from typing import Dict, List, Optional, Set, Tuple
+from io import StringIO
 
+import dateparser
 import requests
 import requests_cache
 from config_path import ConfigPath
@@ -44,7 +46,9 @@ from rich.panel import Panel
 from rich.progress import Progress
 from rich.style import Style
 from rich.table import Table
-from yaml import SafeLoader, load
+from rich.syntax import Syntax
+from yaml import SafeLoader, load, dump
+
 
 nop = lambda x: x
 
@@ -57,6 +61,10 @@ CACHE_LIFETIME = 300
 console = Console()
 
 
+class TooManyResultsException(Exception):
+    pass
+
+
 class YesPlatformAPI:
     DEFAULT_URLS = {
         "sandbox": {
@@ -65,6 +73,7 @@ class YesPlatformAPI:
             "rps": "https://api.sandbox.yes.com/rps/v1/",
             "sps": "https://api.sandbox.yes.com/sps/v1/",
             "banks": "https://api.sandbox.yes.com/banks/v1/",
+            "mrs": "https://api.sandbox.yes.com/mediationrecords/v2/",
         },
         "production": {
             "token_endpoint": "https://as.yes.com/token",
@@ -72,6 +81,7 @@ class YesPlatformAPI:
             "rps": "https://api.yes.com/rps/v1/",
             "sps": "https://api.yes.com/sps/v1/",
             "banks": "https://api.yes.com/banks/v1/",
+            "mrs": "https://api.yes.com/mediationrecords/v2/",
         },
     }
 
@@ -101,7 +111,16 @@ class YesPlatformAPI:
             cert=self.cert_pair,
             timeout=TIMEOUT,
         )
-        return req.json()
+        resp = req.json()
+        if "error" in resp:
+            if resp["error"] == "invalid_request" and resp[
+                "error_description"
+            ].startswith("There are more results"):
+                print(resp)
+                raise TooManyResultsException()
+            else:
+                raise Exception(resp["error_description"])
+        return resp
 
 
 def nice_formatter(inval):
@@ -134,6 +153,7 @@ class Dataset:
     original_row_count: int = 0
     custom_types: Dict = {}
 
+    CLI_IDENTIFIER: str
     STANDARD_API: Optional[str] = None
 
     def __init__(self, rows, sort=set()):
@@ -209,7 +229,77 @@ class Dataset:
     def get(cls, api, args):
         with console.status("Retrieving list ..."):
             rows = api.get(cls.STANDARD_API)
-        return cls(rows)
+
+        data = cls(rows)
+        data.handle_args(args)
+        return data
+
+    def handle_args(self, args):
+        if args.where:
+            compile(args.where, "provided where expression", "eval")
+        if args.only:
+            self.limit_columns_to(args.only)
+        elif getattr(args, "with"):
+            self.output_columns_append(getattr(args, "with"))
+        if args.with_all:
+            self.output_all_columns()
+        if args.sort:
+            self.set_sort(args.sort)
+        if args.where:
+            compile(args.where, "provided where expression", "eval")
+            self.where = args.where
+        elif args.all_rows:
+            self.where = None
+
+    @classmethod
+    def add_subparser(cls, subparsers):
+        p = subparsers.add_parser(cls.CLI_IDENTIFIER)
+        p.set_defaults(sp_class=cls)
+
+        group = p.add_mutually_exclusive_group()
+
+        group.add_argument(
+            "--with",
+            type=str,
+            default=None,
+            help="Add certain fields to output, provided as comma-separated list. E.g.: --with allowed_claims",
+        )
+        group.add_argument(
+            "--with-all",
+            action="store_true",
+            help="Include all available fields in the output",
+        )
+        group.add_argument(
+            "--only",
+            type=str,
+            default=None,
+            help="Limit output to certain fields, provided as comma-separated list. E.g.: --only active,id",
+        )
+        p.add_argument(
+            "--sort",
+            type=str,
+            default=None,
+            help="Sort by field(s), provided as comma-separated list. E.g.: --sort name",
+        )
+
+        group = p.add_mutually_exclusive_group()
+        group.add_argument(
+            "--where",
+            type=str,
+            default=None,
+            help="Add/modify filter. Python expression, row field available as variables, e.g. --where '\"bankid\" in issuer_url'. Use --all to disable filtering. ",
+        )
+        group.add_argument(
+            "--all-rows",
+            action="store_true",
+            help="Disable filtering. ",
+        )
+        p.add_argument(
+            "--raw",
+            action="store_true",
+            help="Disable conversion of data to more readable representations. ",
+        )
+        return p
 
 
 def retrieve_auxilliary_data_parallel(
@@ -233,10 +323,10 @@ def retrieve_auxilliary_data_parallel(
 
 
 class CustomType:
-    pass
+    raw: object
 
 
-class JWKS(CustomType):
+class JWKSCustomType(CustomType):
     def __init__(self, jwks):
         self.raw = jwks
         self.certs = [self._read_certificate(c["x5c"][0]) for c in jwks["keys"]]
@@ -268,15 +358,37 @@ class JWKS(CustomType):
         return out
 
 
+class ClaimsCustomType(CustomType):
+    def __init__(self, data):
+        self.raw = data
+        yml = StringIO()
+        dump(self.raw, yml)
+        self.yaml = yml.getvalue()
+
+    def get_rich(self):
+        return Syntax(
+            self.yaml,
+            "yaml",
+            theme="ansi_dark",
+        )
+
+    def __contains__(self, key):
+        return key in self.yaml
+
+
 class IDPDataset(Dataset):
     output_columns = ("id", "iss", "bics", "owner_id")
     sort = ("bics",)
     where = "status=='active'"
+
     STANDARD_API = "idps"
+    CLI_IDENTIFIER = "idps"
 
 
 class IDPBankDataset(IDPDataset):
     output_columns = ("id", "iss", "name")
+
+    CLI_IDENTIFIER = "idps+banks"
 
     @classmethod
     def get(cls, api, args):
@@ -292,6 +404,8 @@ class IDPBankDataset(IDPDataset):
 
 
 class IDPIssuerDataset(IDPDataset):
+    CLI_IDENTIFIER = "idps+oidc"
+
     @classmethod
     def get(cls, api, args):
         iss_dataset = super().get(api, args)
@@ -306,6 +420,8 @@ class IDPIssuerDataset(IDPDataset):
 
 
 class IDPIssuerBankDataset(IDPBankDataset):
+    CLI_IDENTIFIER = "idps+banks+oidc"
+
     @classmethod
     def get(cls, api, args):
         iss_dataset = super().get(api, args)
@@ -323,16 +439,99 @@ class RPDataset(Dataset):
     output_columns = ("client_id", "client_name")
     sort = ("client_id",)
     where = "status=='active'"
-    custom_types = {"jwks": JWKS}
+    custom_types = {"jwks": JWKSCustomType}
+
     STANDARD_API = "rps"
+    CLI_IDENTIFIER = "rps"
 
 
 class SPDataset(Dataset):
     output_columns = ("client_id", "client_name")
     sort = ("client_id",)
     where = "status=='active'"
-    custom_types = {"jwks": JWKS}
+    custom_types = {"jwks": JWKSCustomType}
+
     STANDARD_API = "sps"
+    CLI_IDENTIFIER = "sps"
+
+
+class MRDataset(Dataset):
+    output_columns = ("type", "client_id", "issuer")
+    sort = ("creation_time",)
+    custom_types = {
+        "requested_claims": ClaimsCustomType,
+    }
+
+    STANDARD_API = "mrs"
+    CLI_IDENTIFIER = "mrs"
+    RECURSION_LIMIT = 10
+    DATE_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+    @classmethod
+    def add_subparser(cls, api):
+        p = super().add_subparser(api)
+        p.add_argument(
+            "--from",
+            "-f",
+            required=True,
+            help="Retrieve mediation records from this date/time. Relative times allowed, e.g., '1 month ago'.",
+        )
+
+        p.add_argument(
+            "--to",
+            "-t",
+            help="Retrieve mediation records from this date/time. Relative times allowed, e.g., '1 month ago'.",
+        )
+
+    @classmethod
+    def get(cls, api, args):
+        from_ = dateparser.parse(getattr(args, "from"), settings={"TO_TIMEZONE": "UTC"})
+
+        if getattr(args, "to"):
+            to_ = dateparser.parse(getattr(args, "to"), settings={"TO_TIMEZONE": "UTC"})
+        else:
+            to_ = datetime.now()
+
+        tracker = {'total_requests': 1, 'completed_requests': 0}
+        try:
+            with console.status("Retrieving list ..."):
+                rows = list(cls._get_from_to(api, from_, to_, tracker))
+        except TooManyResultsException:
+            console.print(
+                "[red]Too many results, please define a shorter time window![/red]"
+            )
+            sys.exit(1)
+
+        data = cls(rows)
+        data.handle_args(args)
+        return data
+
+    @classmethod
+    def _get_from_to(cls, api, from_: datetime, to_: datetime, tracker):
+        assert from_ < to_
+        if tracker['total_requests'] > cls.RECURSION_LIMIT:
+            raise TooManyResultsException()
+
+        try:
+            yield from api.get(
+                cls.STANDARD_API,
+                {
+                    "from": from_.strftime(cls.DATE_FORMAT),
+                    "to": to_.strftime(cls.DATE_FORMAT),
+                },
+            )
+            tracker['completed_requests'] += 1
+        except TooManyResultsException:
+            middle = from_ + (to_ - from_)/2
+            print (f"Recursing ({from_} → {middle} → {to_})")
+            tracker['total_requests'] += 1
+            yield from cls._get_from_to(
+                api, from_, middle, tracker
+            )
+            tracker['total_requests'] += 1
+            yield from cls._get_from_to(
+                api, middle, to_, tracker
+            )
 
 
 def update_and_remap_keys(existing_dict, prefix, dct):
@@ -433,6 +632,7 @@ FORMAT_OPTS = {
     "table": {"function": output_rich, "disable_cache": False},
 }
 
+
 if __name__ == "__main__":
     configpath = ConfigPath("yes", "platform-client", "")
     requests_cache.core.install_cache(
@@ -443,85 +643,40 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("credentials_file", type=argparse.FileType("r"))
+    parser.add_argument(
+        "--no-cache",
+        "-n",
+        action="store_true",
+        help=f"Disable caching. By default, all requests are cached for {CACHE_LIFETIME} seconds.",
+    )
+    parser.add_argument(
+        "--format",
+        choices=FORMAT_OPTS.keys(),
+        default="table",
+        help="Define the output format.",
+    )
+    parser.add_argument(
+        "--export",
+        type=str,
+        help="Export to HTML file.",
+    )
 
     subparsers = parser.add_subparsers()
 
     create_subparsers = [
-        ("idps", IDPDataset),
-        ("idps+oidc", IDPIssuerDataset),
-        ("idps+banks", IDPBankDataset),
-        ("idps+banks+oidc", IDPIssuerBankDataset),
-        ("rps", RPDataset),
-        ("sps", SPDataset),
+        IDPDataset,
+        IDPIssuerDataset,
+        IDPBankDataset,
+        IDPIssuerBankDataset,
+        RPDataset,
+        SPDataset,
+        MRDataset,
     ]
 
-    for sp_name, sp_func in create_subparsers:
-        p = subparsers.add_parser(sp_name)
-        p.set_defaults(func=sp_func.get)
-
-        p.add_argument(
-            "--no-cache",
-            "-n",
-            action="store_true",
-            help=f"Disable caching. By default, all requests are cached for {CACHE_LIFETIME} seconds.",
-        )
-
-        p.add_argument(
-            "--with",
-            type=str,
-            default=None,
-            help="Add certain fields to output, provided as comma-separated list. E.g.: --with allowed_claims",
-        )
-        p.add_argument(
-            "--with-all",
-            action="store_true",
-            help="Include all available fields in the output",
-        )
-        p.add_argument(
-            "--only",
-            type=str,
-            default=None,
-            help="Limit output to certain fields, provided as comma-separated list. E.g.: --only active,id",
-        )
-        p.add_argument(
-            "--format",
-            "-f",
-            choices=FORMAT_OPTS.keys(),
-            default="table",
-            help="Define the output format.",
-        )
-        p.add_argument(
-            "--export",
-            "-e",
-            type=str,
-            help="Export to HTML file.",
-        )
-        p.add_argument(
-            "--sort",
-            type=str,
-            default=None,
-            help="Sort by field(s), provided as comma-separated list. E.g.: --sort name",
-        )
-        p.add_argument(
-            "--where",
-            type=str,
-            default=None,
-            help="Add/modify filter. Python expression, row field available as variables, e.g. --where '\"bankid\" in issuer_url'. Use --all to disable filtering. ",
-        )
-        p.add_argument(
-            "--all-rows",
-            action="store_true",
-            help="Disable filtering. ",
-        )
-        p.add_argument(
-            "--raw",
-            action="store_true",
-            help="Disable conversion of data to more readable representations. ",
-        )
+    for sp_class in create_subparsers:
+        sp_class.add_subparser(subparsers)
 
     args = parser.parse_args()
-    if args.where:
-        compile(args.where, "provided where expression", "eval")
 
     no_cache = args.no_cache or FORMAT_OPTS[args.format]["disable_cache"]
     if no_cache:
@@ -529,20 +684,9 @@ if __name__ == "__main__":
 
     with console.status("Connecting to yes® platform ...") as status:
         api = YesPlatformAPI(**load(args.credentials_file.read(), Loader=SafeLoader))
-    data: Dataset = args.func(api, args)
-    if args.only:
-        data.limit_columns_to(args.only)
-    elif getattr(args, "with"):
-        data.output_columns_append(getattr(args, "with"))
-    if args.with_all:
-        data.output_all_columns()
-    if args.sort:
-        data.set_sort(args.sort)
-    if args.where:
-        compile(args.where, "provided where expression", "eval")
-        data.where = args.where
-    elif args.all_rows:
-        data.where = None
+
+    data: Dataset = args.sp_class.get(api, args)
+
     FORMAT_OPTS[args.format]["function"](
         data,
         formatter=(string_formatter if args.raw else nice_formatter),
