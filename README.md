@@ -1,6 +1,6 @@
 # yes® Platform Client
 
-**NOTE:** This software is *not* required to use yes® services. Do not rely on it unless explicitly asked to do so.
+**NOTE:** This software is *not* required to use yes® services. Do not use it unless explicitly recommended to do so.
 
 ## Set-Up
 
