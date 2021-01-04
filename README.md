@@ -63,7 +63,20 @@ Filter active: `status=='active'` → 54 rows of 54 available rows shown.
 **Note:** Default settings for columns, sorting, and filtering are applied. 
 
 ### Combining Datasets
-The list of issuers (`idps`) can be combined with bank information (`+banks`) and/or with the information retrievable from the OpenID Connect configuration files. Valid combinations: `idps+banks`, `idps+oidc`, and `idps+banks+oidc`. Fields that occur in multiple datasets are prefixed with `bank__` and `oidc__`, respectively. When an issuer file or bank information cannot be retrieved, the special columns `__oidc_error` and `__bank_error` contains the respective error messages. `mrs` always combines the records with client information.
+The list of issuers (`idps`) can be combined with bank information (`+banks`) and/or with the information retrievable from the OpenID Connect configuration files (`+oidc`) and service configurations (`+sc`). Valid combinations: 
+
+ * `idps`
+ * `idps+banks`
+ * `idps+oidc`
+ * `idps+banks+oidc`
+ * `idps+sc`
+ * `idps+banks+sc`
+ * `idps+oidc+sc`
+ * `idps+banks+oidc+sc`
+
+Fields that occur in multiple datasets are prefixed with `bank__`, `oidc__`, or `sc__`, respectively. When additional information cannot be retrieved, the special columns `__oidc_error`, `__bank_error`, and `__sc_error` contain the respective error messages. 
+
+`mrs` always combines the records with client information.
 
 
 ### Show/Hide Columns

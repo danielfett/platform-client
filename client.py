@@ -44,6 +44,7 @@ from rich.color import Color
 from rich.console import Console, RenderGroup
 from rich.panel import Panel
 from rich.progress import Progress
+from rich.markdown import Markdown
 from rich.style import Style
 from rich.table import Table
 from rich.syntax import Syntax
@@ -56,7 +57,7 @@ nop = lambda x: x
 PARALLEL_REQUESTS = 100
 PARALLEL_REQUESTS_PLATFORM = 15
 TIMEOUT = (14, 14)
-CACHE_LIFETIME = 300
+CACHE_LIFETIME = 600
 
 console = Console()
 
@@ -74,6 +75,7 @@ class YesPlatformAPI:
             "sps": "https://api.sandbox.yes.com/sps/v1/",
             "banks": "https://api.sandbox.yes.com/banks/v1/",
             "mrs": "https://api.sandbox.yes.com/mediationrecords/v2/",
+            "sc": "https://api.sandbox.yes.com/service-configuration/v1/",
         },
         "production": {
             "token_endpoint": "https://as.yes.com/token",
@@ -82,6 +84,7 @@ class YesPlatformAPI:
             "sps": "https://api.yes.com/sps/v1/",
             "banks": "https://api.yes.com/banks/v1/",
             "mrs": "https://api.yes.com/mediationrecords/v2/",
+            "sc": "https://api.yes.com/service-configuration/v1/",
         },
     }
 
@@ -129,7 +132,7 @@ def nice_formatter(inval):
     elif isinstance(inval, CustomType):
         return inval.get_rich()
     elif type(inval) == list:
-        return "[light_sky_blue1],[/light_sky_blue1] ".join(inval)
+        return "[light_sky_blue1],[/light_sky_blue1] ".join(str(x) for x in inval)
     else:
         return str(inval)
 
@@ -152,6 +155,7 @@ class Dataset:
     where: Optional[str] = None
     original_row_count: int = 0
     custom_types: Dict = {}
+    add_ons: List = []
 
     CLI_IDENTIFIER: str
     STANDARD_API: Optional[str] = None
@@ -179,8 +183,8 @@ class Dataset:
                         row[f] = self.custom_types[f](row[f])
 
     def limit_columns_to(self, columns):
-        limit_columns = set(columns.split(","))
-        self.output_columns = limit_columns.intersection(self.available_columns)
+        limit_columns = columns.split(",")
+        self.output_columns = list(x for x in self.available_columns if x in limit_columns)
 
     def output_columns_append(self, columns):
         add_columns = tuple(columns.split(","))
@@ -225,12 +229,30 @@ class Dataset:
                 except TypeError:
                     pass
 
+    def opportunistic_where_applied(self):
+        if self.where is None:
+            yield from self.rows
+        else:
+            for row in self.rows:
+                try:
+                    if eval(self.where, {}, row):
+                        yield row
+                except (TypeError, NameError):
+                    yield row
+
     @classmethod
     def get(cls, api, args):
         with console.status(f"Retrieving list ({cls.CLI_IDENTIFIER})..."):
             rows = api.get(cls.STANDARD_API)
 
         data = cls(rows)
+        data.handle_args(args)
+
+        selected_add_ons = args.action_name.split("+")
+        for addon in cls.add_ons:
+            if addon.CLI_IDENTIFIER in selected_add_ons:
+                data = cls(addon.enrich(api, data))
+
         data.handle_args(args)
         return data
 
@@ -246,14 +268,18 @@ class Dataset:
         if args.sort:
             self.set_sort(args.sort)
         if args.where:
-            compile(args.where, "provided where expression", "eval")
             self.where = args.where
         elif args.all_rows:
             self.where = None
 
     @classmethod
     def add_subparser(cls, subparsers):
-        p = subparsers.add_parser(cls.CLI_IDENTIFIER)
+        aliases = [cls.CLI_IDENTIFIER]
+        for addon in cls.add_ons:
+            for el in list(aliases):
+                aliases.append(f"{el}+{addon.CLI_IDENTIFIER}")
+
+        p = subparsers.add_parser(aliases[0], aliases=aliases[1:])
         p.set_defaults(sp_class=cls)
 
         group = p.add_mutually_exclusive_group()
@@ -302,26 +328,6 @@ class Dataset:
         return p
 
 
-def retrieve_auxilliary_data_parallel(
-    api, dataset: Dataset, parallel_requests, update_fn, new_dataset_class, status_text
-):
-    orig_data = dataset.rows
-    data = []
-
-    def progress_bar():
-        with Progress() as progress:
-            task = progress.add_task(status_text, total=len(orig_data))
-            while len(data) < len(orig_data):
-                progress.update(task, completed=len(data))
-                sleep(0.1)
-
-    with ThreadPoolExecutor(max_workers=parallel_requests) as executor:
-        executor.submit(progress_bar)
-        executor.map(lambda x: update_fn(data, api, x), orig_data)
-
-    return new_dataset_class(data)
-
-
 class CustomType:
     raw: object
 
@@ -360,6 +366,19 @@ class JWKSCustomType(CustomType):
         return out
 
 
+class RemoteSignatureCreationCustomType(CustomType):
+    def __init__(self, raw):
+        self.raw = raw
+
+    def get_rich(self):
+        lines = []
+        for endpoint in self.raw:
+            out = f" * {endpoint['qtsp_id']} @ {endpoint['signDoc']}\n   conformance_levels_supported: {', '.join(endpoint['conformance_levels_supported'])}"
+            lines.append(out)
+
+        return Markdown("\n".join(lines))
+
+
 class ClaimsCustomType(CustomType):
     def __init__(self, data):
         self.raw = data
@@ -378,63 +397,125 @@ class ClaimsCustomType(CustomType):
         return key in self.yaml
 
 
+class DataAddOn:
+    CLI_IDENTIFIER: str
+    OUTPUT_PREFIX: str
+    ERROR_CONST: str
+    IS_PLATFORM: True
+    STATUS_TEXT: str
+
+    def __init__(self):
+        self.ERROR_CONST = f"__{self.OUTPUT_PREFIX}_error"
+
+    def _update_and_remap_keys(self, existing_dict, dct, existing_columns):
+        for key, value in dct.items():
+            if key in existing_columns:
+                existing_dict[f"{self.OUTPUT_PREFIX}__{key}"] = value
+            else:
+                existing_dict[key] = value
+
+    @classmethod
+    def enrich(cls, api, dataset: Dataset):
+        orig_data = list(dataset.opportunistic_where_applied())
+        data = []
+
+        instance = cls()
+
+        existing_columns = dataset.available_columns
+
+        def progress_bar():
+            with Progress() as progress:
+                task = progress.add_task(instance.STATUS_TEXT, total=len(orig_data))
+                while len(data) < len(orig_data):
+                    progress.update(task, completed=len(data))
+                    sleep(0.1)
+
+        with ThreadPoolExecutor(
+            max_workers=PARALLEL_REQUESTS_PLATFORM
+            if cls.IS_PLATFORM
+            else PARALLEL_REQUESTS
+        ) as executor:
+            executor.submit(progress_bar)
+            executor.map(
+                lambda x: instance.fetch_and_store(data, api, x, existing_columns),
+                orig_data,
+            )
+
+        return data
+
+
+class BankAddOn(DataAddOn):
+    CLI_IDENTIFIER = "banks"
+    OUTPUT_PREFIX = "bank"
+    IS_PLATFORM = True
+    STATUS_TEXT = "Retrieving bank information"
+
+    def fetch_and_store(self, out_data, api, idp, existing_columns):
+        try:
+            bank_information = api.get("banks", {"term": idp["bics"][0], "limit": 1})[0]
+            self._update_and_remap_keys(idp, bank_information, existing_columns)
+        except Exception as e:
+            idp[self.ERROR_CONST] = e
+        finally:
+            out_data.append(idp)
+
+
+class OIDCAddOn(DataAddOn):
+    CLI_IDENTIFIER = "oidc"
+    OUTPUT_PREFIX = "oidc"
+    IS_PLATFORM = False
+    STATUS_TEXT = "Retrieving OIDC information"
+
+    def fetch_and_store(self, out_data, _, idp, existing_columns):
+        config_url = f"{idp['iss']}/.well-known/openid-configuration"
+        try:
+            config_file = requests.get(
+                config_url,
+                timeout=TIMEOUT,
+            ).json()
+        except requests.exceptions.ConnectionError:
+            idp[self.ERROR_CONST] = "Failed to connect."
+        except json.decoder.JSONDecodeError:
+            idp[self.ERROR_CONST] = "Failed to parse OIDC config."
+        except Exception as e:
+            idp[self.ERROR_CONST] = repr(e)
+        else:
+            idp[self.ERROR_CONST] = None
+            self._update_and_remap_keys(idp, config_file, existing_columns)
+        finally:
+            out_data.append(idp)
+
+
+class SCAddOn(DataAddOn):
+    CLI_IDENTIFIER = "sc"
+    OUTPUT_PREFIX = "sc"
+    IS_PLATFORM = True
+    STATUS_TEXT = "Retrieving Service Configuration information"
+
+    def fetch_and_store(self, out_data, api, idp, existing_columns):
+        if idp["status"] == "inactive":
+            idp[self.ERROR_CONST] = f"The issuer {idp['iss']} is not active."
+            out_data.append(idp)
+            return
+
+        try:
+            sc_information = api.get("sc", {"iss": idp["iss"]})
+            self._update_and_remap_keys(idp, sc_information, existing_columns)
+        except Exception as e:
+            idp[self.ERROR_CONST] = e
+        finally:
+            out_data.append(idp)
+
+
 class IDPDataset(Dataset):
     output_columns = ("id", "iss", "bics", "owner_id")
     sort = ("bics",)
     where = "status=='active'"
+    add_ons = [BankAddOn, OIDCAddOn, SCAddOn]
+    custom_types = {"remote_signature_creation": RemoteSignatureCreationCustomType}
 
     STANDARD_API = "idps"
     CLI_IDENTIFIER = "idps"
-
-
-class IDPBankDataset(IDPDataset):
-    output_columns = ("id", "iss", "name")
-
-    CLI_IDENTIFIER = "idps+banks"
-
-    @classmethod
-    def get(cls, api, args):
-        iss_dataset = super().get(api, args)
-        return retrieve_auxilliary_data_parallel(
-            api,
-            iss_dataset,
-            PARALLEL_REQUESTS_PLATFORM,
-            fetch_and_store_bank,
-            cls,
-            "Fetching bank information",
-        )
-
-
-class IDPIssuerDataset(IDPDataset):
-    CLI_IDENTIFIER = "idps+oidc"
-
-    @classmethod
-    def get(cls, api, args):
-        iss_dataset = super().get(api, args)
-        return retrieve_auxilliary_data_parallel(
-            api,
-            iss_dataset,
-            PARALLEL_REQUESTS,
-            fetch_and_store_issuer,
-            cls,
-            "Fetching OIDC configuration files",
-        )
-
-
-class IDPIssuerBankDataset(IDPBankDataset):
-    CLI_IDENTIFIER = "idps+banks+oidc"
-
-    @classmethod
-    def get(cls, api, args):
-        iss_dataset = super().get(api, args)
-        return retrieve_auxilliary_data_parallel(
-            api,
-            iss_dataset,
-            PARALLEL_REQUESTS,
-            fetch_and_store_issuer,
-            cls,
-            "Fetching OIDC configuration files",
-        )
 
 
 class RPDataset(Dataset):
@@ -544,46 +625,6 @@ class MRDataset(Dataset):
             yield from cls._get_from_to(api, middle, to_, tracker)
 
 
-def update_and_remap_keys(existing_dict, prefix, dct):
-    for key, value in dct.items():
-        if key in existing_dict:
-            existing_dict[f"{prefix}__{key}"] = value
-        else:
-            existing_dict[key] = value
-
-
-def fetch_and_store_issuer(out_data, _, idp):
-    ERROR_CONST = "__oidc_error"
-    config_url = f"{idp['iss']}/.well-known/openid-configuration"
-    try:
-        config_file = requests.get(
-            config_url,
-            timeout=TIMEOUT,
-        ).json()
-    except requests.exceptions.ConnectionError:
-        idp[ERROR_CONST] = "Failed to connect."
-    except json.decoder.JSONDecodeError:
-        idp[ERROR_CONST] = "Failed to parse OIDC config."
-    except Exception as e:
-        idp[ERROR_CONST] = repr(e)
-    else:
-        idp[ERROR_CONST] = None
-        update_and_remap_keys(idp, "oidc", config_file)
-    finally:
-        out_data.append(idp)
-
-
-def fetch_and_store_bank(out_data, api, idp):
-    ERROR_CONST = "__bank_error"
-    try:
-        bank_information = api.get("banks", {"term": idp["bics"][0], "limit": 1})[0]
-        update_and_remap_keys(idp, "bank", bank_information)
-    except Exception as e:
-        idp[ERROR_CONST] = e
-    finally:
-        out_data.append(idp)
-
-
 def output_json_lines(data: Dataset, formatter, cache_disabled):
     for el in data.get_rows(False, sort=False):
         print(json.dumps(el))
@@ -671,13 +712,10 @@ if __name__ == "__main__":
         help="Export to HTML file.",
     )
 
-    subparsers = parser.add_subparsers()
+    subparsers = parser.add_subparsers(required=True, dest="action_name")
 
     create_subparsers = [
         IDPDataset,
-        IDPIssuerDataset,
-        IDPBankDataset,
-        IDPIssuerBankDataset,
         RPDataset,
         SPDataset,
         MRDataset,
