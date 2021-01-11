@@ -149,7 +149,7 @@ def string_formatter(inval):
 
 class Dataset:
     rows: List[Dict]
-    output_columns: Optional = None
+    output_columns: Optional[List] = None
     available_columns: Optional[Set] = None
     sort: Optional[Set] = None
     where: Optional[str] = None
@@ -168,7 +168,7 @@ class Dataset:
             self.available_columns |= set(row.keys())
         self._sanitize()
         if not self.output_columns:
-            self.output_columns = self.available_columns
+            self.output_columns = list(self.available_columns)
 
     def _sanitize(self):
         for row in self.rows:
@@ -184,11 +184,12 @@ class Dataset:
 
     def limit_columns_to(self, columns):
         limit_columns = columns.split(",")
-        self.output_columns = list(x for x in self.available_columns if x in limit_columns)
+        self.output_columns = list(x for x in limit_columns if x in self.available_columns)
 
     def output_columns_append(self, columns):
-        add_columns = tuple(columns.split(","))
-        self.output_columns += add_columns
+        for c in columns.split(','):
+            if c in self.available_columns and not c in self.output_columns:
+                self.output_columns.append(c)
 
     def output_all_columns(self):
         self.output_columns = self.available_columns
@@ -508,7 +509,7 @@ class SCAddOn(DataAddOn):
 
 
 class IDPDataset(Dataset):
-    output_columns = ("id", "iss", "bics", "owner_id")
+    output_columns = ["id", "iss", "bics", "owner_id"]
     sort = ("bics",)
     where = "status=='active'"
     add_ons = [BankAddOn, OIDCAddOn, SCAddOn]
@@ -519,7 +520,7 @@ class IDPDataset(Dataset):
 
 
 class RPDataset(Dataset):
-    output_columns = ("client_id", "client_name")
+    output_columns = ["client_id", "client_name"]
     sort = ("client_id",)
     where = "status=='active'"
     custom_types = {"jwks": JWKSCustomType}
@@ -529,7 +530,7 @@ class RPDataset(Dataset):
 
 
 class SPDataset(Dataset):
-    output_columns = ("client_id", "client_name")
+    output_columns = ["client_id", "client_name"]
     sort = ("client_id",)
     where = "status=='active'"
     custom_types = {"jwks": JWKSCustomType}
@@ -539,7 +540,7 @@ class SPDataset(Dataset):
 
 
 class MRDataset(Dataset):
-    output_columns = ("type", "client_id", "issuer")
+    output_columns = ["type", "client_id", "issuer"]
     sort = ("creation_time",)
     custom_types = {
         "requested_claims": ClaimsCustomType,
@@ -565,6 +566,15 @@ class MRDataset(Dataset):
             "-t",
             help="Retrieve mediation records from this date/time. Relative times allowed, e.g., '1 month ago'.",
         )
+
+    @classmethod
+    def _update_and_remap_keys(cls, existing_dict, dct, existing_columns):
+        for key, value in dct.items():
+            if key in existing_columns:
+                existing_dict[f"client__{key}"] = value
+            else:
+                existing_dict[key] = value
+
 
     @classmethod
     def get(cls, api, args):
@@ -596,7 +606,7 @@ class MRDataset(Dataset):
                 rp_entry = rp_data_by_client_id[row["client_id"]]
             except KeyError:
                 rp_entry = {"__client_error": "Client ID not found."}
-            update_and_remap_keys(row, "client", rp_entry)
+            cls._update_and_remap_keys(row, rp_entry, data.available_columns)
         data = cls(data.rows)
         data.handle_args(args)
         return data
