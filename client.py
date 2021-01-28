@@ -22,16 +22,17 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
 
 import argparse
+import csv
 import json
 import sys
 from base64 import b64decode
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
+from io import StringIO
 from operator import attrgetter, itemgetter
 from time import sleep
 from typing import Dict, List, Optional, Set, Tuple
-from io import StringIO
 
 import dateparser
 import requests
@@ -42,14 +43,13 @@ from cryptography.hazmat.backends import default_backend
 from rich import box
 from rich.color import Color
 from rich.console import Console, RenderGroup
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.progress import Progress
-from rich.markdown import Markdown
 from rich.style import Style
-from rich.table import Table
 from rich.syntax import Syntax
-from yaml import SafeLoader, load, dump
-
+from rich.table import Table
+from yaml import SafeLoader, dump, load
 
 nop = lambda x: x
 
@@ -162,6 +162,7 @@ class Dataset:
 
     def __init__(self, rows, sort=set()):
         self.rows = rows
+        self._enrich()
         self.original_row_count = len(rows)
         self.available_columns = set()
         for row in self.rows:
@@ -169,6 +170,9 @@ class Dataset:
         self._sanitize()
         if not self.output_columns:
             self.output_columns = list(self.available_columns)
+
+    def _enrich(self):
+        pass
 
     def _sanitize(self):
         for row in self.rows:
@@ -184,10 +188,12 @@ class Dataset:
 
     def limit_columns_to(self, columns):
         limit_columns = columns.split(",")
-        self.output_columns = list(x for x in limit_columns if x in self.available_columns)
+        self.output_columns = list(
+            x for x in limit_columns if x in self.available_columns
+        )
 
     def output_columns_append(self, columns):
-        for c in columns.split(','):
+        for c in columns.split(","):
             if c in self.available_columns and not c in self.output_columns:
                 self.output_columns.append(c)
 
@@ -527,6 +533,13 @@ class RPDataset(Dataset):
 
     STANDARD_API = "rps"
     CLI_IDENTIFIER = "rps"
+    EDIT_LINK_FORMAT = (
+        "https://partner.yes.com/relying-parties/update/{owner_id}/{client_id}"
+    )
+
+    def _enrich(self):
+        for row in self.rows:
+            row["edit_link"] = self.EDIT_LINK_FORMAT.format(**row)
 
 
 class SPDataset(Dataset):
@@ -574,7 +587,6 @@ class MRDataset(Dataset):
                 existing_dict[f"client__{key}"] = value
             else:
                 existing_dict[key] = value
-
 
     @classmethod
     def get(cls, api, args):
@@ -682,15 +694,23 @@ def output_rich(data: Dataset, formatter, cache_disabled):
         console.print("[green]Caching enabled. To disable, use[/green] --no-cache")
 
 
+def output_csv(data: Dataset, formatter, cache_disabled):
+    writer = csv.DictWriter(sys.stdout, fieldnames=data.output_columns)
+    writer.writeheader()
+    for row in data.get_rows("", formatter=formatter):
+        writer.writerow(row)
+
+
 def filter_only(fields, expr):
     selected = set(expr.split(","))
     return set(fields).intersection(selected)
 
 
 FORMAT_OPTS = {
-    "json-lines": {"function": output_json_lines, "disable_cache": True},
-    "json-list": {"function": output_json_list, "disable_cache": True},
+    "json-lines": {"function": output_json_lines, "disable_cache": False},
+    "json-list": {"function": output_json_list, "disable_cache": False},
     "table": {"function": output_rich, "disable_cache": False},
+    "csv": {"function": output_csv, "disable_cache": False},
 }
 
 
