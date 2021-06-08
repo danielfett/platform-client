@@ -33,6 +33,8 @@ from io import StringIO
 from operator import attrgetter, itemgetter
 from time import sleep
 from typing import Dict, List, Optional, Set, Tuple
+import logging
+from cryptography.hazmat.primitives import hashes
 
 import dateparser
 import requests
@@ -49,6 +51,7 @@ from rich.progress import Progress
 from rich.style import Style
 from rich.syntax import Syntax
 from rich.table import Table
+from rich.text import Text
 from yaml import SafeLoader, dump, load
 
 nop = lambda x: x
@@ -76,6 +79,7 @@ class YesPlatformAPI:
             "banks": "https://api.sandbox.yes.com/banks/v1/",
             "mrs": "https://api.sandbox.yes.com/mediationrecords/v2/",
             "sc": "https://api.sandbox.yes.com/service-configuration/v1/",
+            "pfclients": "https://as.sandbox.yes.com/clients",
         },
         "production": {
             "token_endpoint": "https://as.yes.com/token",
@@ -85,6 +89,7 @@ class YesPlatformAPI:
             "banks": "https://api.yes.com/banks/v1/",
             "mrs": "https://api.yes.com/mediationrecords/v2/",
             "sc": "https://api.yes.com/service-configuration/v1/",
+            "pfclients": "https://as.sandbox.yes.com/clients",
         },
     }
 
@@ -119,7 +124,6 @@ class YesPlatformAPI:
             if resp["error"] == "invalid_request" and resp[
                 "error_description"
             ].startswith("There are more results"):
-                print(resp)
                 raise TooManyResultsException()
             else:
                 raise Exception(resp["error_description"])
@@ -158,6 +162,7 @@ class Dataset:
     add_ons: List = []
 
     CLI_IDENTIFIER: str
+    CLI_QUICK_SEARCH: List[str] = []
     STANDARD_API: Optional[str] = None
 
     def __init__(self, rows, sort=set()):
@@ -248,22 +253,35 @@ class Dataset:
                     yield row
 
     @classmethod
-    def get(cls, api, args):
+    def get(cls, api: YesPlatformAPI, args):
         with console.status(f"Retrieving list ({cls.CLI_IDENTIFIER})..."):
             rows = api.get(cls.STANDARD_API)
 
         data = cls(rows)
-        data.handle_args(args)
+        # data.handle_args(args)
 
-        selected_add_ons = args.action_name.split("+")
+        selected_add_ons_names = args.action_name.split("+")
+        selected_add_ons = []
         for addon in cls.add_ons:
-            if addon.CLI_IDENTIFIER in selected_add_ons:
+            if addon.CLI_IDENTIFIER in selected_add_ons_names:
                 data = cls(addon.enrich(api, data))
+                selected_add_ons.append(addon)
 
-        data.handle_args(args)
+        data.handle_args(args, selected_add_ons)
         return data
 
-    def handle_args(self, args):
+    def where_from_search(self, search, selected_add_ons):
+        new_where = []
+        for cls in selected_add_ons + [self]:
+            for f in cls.CLI_QUICK_SEARCH:
+                new_where.append(f"{repr(search.lower())} in {f}.lower()")
+
+        if self.where:
+            self.where = f"({self.where}) and ({' or '.join(new_where)})"
+        else:
+            self.where = " or ".join(new_where)
+
+    def handle_args(self, args, selected_add_ons=[]):
         if args.where:
             compile(args.where, "provided where expression", "eval")
         if args.only:
@@ -274,10 +292,13 @@ class Dataset:
             self.output_all_columns()
         if args.sort:
             self.set_sort(args.sort)
+
         if args.where:
             self.where = args.where
         elif args.all_rows:
             self.where = None
+        if self.CLI_QUICK_SEARCH and args.search:
+            self.where_from_search(args.search, selected_add_ons)
 
     @classmethod
     def add_subparser(cls, subparsers):
@@ -288,6 +309,14 @@ class Dataset:
 
         p = subparsers.add_parser(aliases[0], aliases=aliases[1:])
         p.set_defaults(sp_class=cls)
+
+        if cls.CLI_QUICK_SEARCH:
+            p.add_argument(
+                "search",
+                nargs="?",
+                default=None,
+                help="Quick search in a selection of fields.",
+            )
 
         group = p.add_mutually_exclusive_group()
 
@@ -363,10 +392,10 @@ class JWKSCustomType(CustomType):
                 else:
                     color = "green"
 
+                fp = c.fingerprint(hashes.SHA1()).hex(":").upper()
+
                 out.renderables.append(
-                    Panel(
-                        f"{c.subject.rfc4514_string()}\n[{color}]valid until {c.not_valid_after}[/{color}]"
-                    )
+                    f"{c.subject.rfc4514_string()}\n  [{color}]valid until {c.not_valid_after}[/{color}]\n  {fp}"
                 )
             except Exception as e:
                 out.renderables.append(Panel(f"[red](unable to decode: {e})[/red]"))
@@ -406,6 +435,7 @@ class ClaimsCustomType(CustomType):
 
 class DataAddOn:
     CLI_IDENTIFIER: str
+    CLI_QUICK_SEARCH: List[str] = []
     OUTPUT_PREFIX: str
     ERROR_CONST: str
     IS_PLATFORM: True
@@ -453,11 +483,12 @@ class DataAddOn:
 
 class BankAddOn(DataAddOn):
     CLI_IDENTIFIER = "banks"
+    CLI_QUICK_SEARCH = ["city", "bic"]
     OUTPUT_PREFIX = "bank"
     IS_PLATFORM = True
     STATUS_TEXT = "Retrieving bank information"
 
-    def fetch_and_store(self, out_data, api, idp, existing_columns):
+    def fetch_and_store(self, out_data, api: YesPlatformAPI, idp, existing_columns):
         try:
             bank_information = api.get("banks", {"term": idp["bics"][0], "limit": 1})[0]
             self._update_and_remap_keys(idp, bank_information, existing_columns)
@@ -499,7 +530,7 @@ class SCAddOn(DataAddOn):
     IS_PLATFORM = True
     STATUS_TEXT = "Retrieving Service Configuration information"
 
-    def fetch_and_store(self, out_data, api, idp, existing_columns):
+    def fetch_and_store(self, out_data, api: YesPlatformAPI, idp, existing_columns):
         if idp["status"] == "inactive":
             idp[self.ERROR_CONST] = f"The issuer {idp['iss']} is not active."
             out_data.append(idp)
@@ -523,6 +554,7 @@ class IDPDataset(Dataset):
 
     STANDARD_API = "idps"
     CLI_IDENTIFIER = "idps"
+    CLI_QUICK_SEARCH = ["id", "iss"]
 
 
 class RPDataset(Dataset):
@@ -533,6 +565,7 @@ class RPDataset(Dataset):
 
     STANDARD_API = "rps"
     CLI_IDENTIFIER = "rps"
+    CLI_QUICK_SEARCH = ["client_id", "owner_id", "ac_redirect_uri", "client_name"]
     EDIT_LINK_FORMAT = (
         "https://partner.yes.com/relying-parties/update/{owner_id}/{client_id}"
     )
@@ -546,10 +579,20 @@ class SPDataset(Dataset):
     output_columns = ["client_id", "client_name"]
     sort = ("client_id",)
     where = "status=='active'"
-    custom_types = {"jwks": JWKSCustomType}
+    custom_types = {"jwks": JWKSCustomType, "required_claims": ClaimsCustomType}
 
     STANDARD_API = "sps"
     CLI_IDENTIFIER = "sps"
+
+
+class PFClientDataset(Dataset):
+    output_columns = ["client_id", "client_name"]
+    sort = ("client_id",)
+    where = "status=='active'"
+    custom_types = {"jwks": JWKSCustomType}
+
+    STANDARD_API = "pfclients"
+    CLI_IDENTIFIER = "clients"
 
 
 class MRDataset(Dataset):
@@ -562,7 +605,7 @@ class MRDataset(Dataset):
     STANDARD_API = "mrs"
     CLI_IDENTIFIER = "mrs"
     RECURSION_LIMIT = 20
-    DATE_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+    DATE_FORMAT = "%Y-%m-%dT%H:%M:%S+00:00"
 
     @classmethod
     def add_subparser(cls, api):
@@ -580,6 +623,12 @@ class MRDataset(Dataset):
             help="Retrieve mediation records from this date/time. Relative times allowed, e.g., '1 month ago'.",
         )
 
+        p.add_argument(
+            "--owner-id",
+            "-o",
+            help="Retrieve mediation records only for this specific owner id.",
+        )
+
     @classmethod
     def _update_and_remap_keys(cls, existing_dict, dct, existing_columns):
         for key, value in dct.items():
@@ -589,7 +638,7 @@ class MRDataset(Dataset):
                 existing_dict[key] = value
 
     @classmethod
-    def get(cls, api, args):
+    def get(cls, api: YesPlatformAPI, args):
         from_ = dateparser.parse(getattr(args, "from"), settings={"TO_TIMEZONE": "UTC"})
 
         if getattr(args, "to"):
@@ -597,10 +646,15 @@ class MRDataset(Dataset):
         else:
             to_ = datetime.now()
 
+        if getattr(args, "owner_id"):
+            owner_id = getattr(args, "owner_id")
+        else:
+            owner_id = None
+
         tracker = {"total_requests": 1, "completed_requests": 0}
         try:
             with console.status(f"Retrieving list ({cls.CLI_IDENTIFIER})..."):
-                rows = list(cls._get_from_to(api, from_, to_, tracker))
+                rows = list(cls._get_from_to(api, from_, to_, owner_id, tracker))
         except TooManyResultsException:
             console.print(
                 "[red]Too many results, please define a shorter time window![/red]"
@@ -613,38 +667,45 @@ class MRDataset(Dataset):
         rp_data_by_client_id = {row["client_id"]: row for row in rp_data}
 
         data = cls(rows)
-        for row in data.rows:
-            try:
-                rp_entry = rp_data_by_client_id[row["client_id"]]
-            except KeyError:
-                rp_entry = {"__client_error": "Client ID not found."}
-            cls._update_and_remap_keys(row, rp_entry, data.available_columns)
+        # for row in data.rows:
+        #    try:
+        #        rp_entry = rp_data_by_client_id[row["client_id"]]
+        #    except KeyError:
+        #        rp_entry = {"__client_error": "Client ID not found."}
+        #    cls._update_and_remap_keys(row, rp_entry, data.available_columns)
         data = cls(data.rows)
         data.handle_args(args)
         return data
 
     @classmethod
-    def _get_from_to(cls, api, from_: datetime, to_: datetime, tracker):
+    def _get_from_to(
+        cls, api: YesPlatformAPI, from_: datetime, to_: datetime, owner_id: Optional[str], tracker
+    ):
         assert from_ < to_
         if tracker["total_requests"] > cls.RECURSION_LIMIT:
             raise TooManyResultsException()
 
+        data = {
+            "from": from_.strftime(cls.DATE_FORMAT),
+            "to": to_.strftime(cls.DATE_FORMAT),
+        }
+
+        if owner_id:
+            data["owner_id"] = owner_id
+
         try:
             yield from api.get(
                 cls.STANDARD_API,
-                {
-                    "from": from_.strftime(cls.DATE_FORMAT),
-                    "to": to_.strftime(cls.DATE_FORMAT),
-                },
+                data,
             )
             tracker["completed_requests"] += 1
         except TooManyResultsException:
             middle = from_ + (to_ - from_) / 2
-            print(f"Recursing ({from_} → {middle} → {to_})")
+            # console.log(f"Recursing ({from_} → {middle} → {to_})")
             tracker["total_requests"] += 1
-            yield from cls._get_from_to(api, from_, middle, tracker)
+            yield from cls._get_from_to(api, from_, middle, owner_id, tracker)
             tracker["total_requests"] += 1
-            yield from cls._get_from_to(api, middle, to_, tracker)
+            yield from cls._get_from_to(api, middle, to_, owner_id, tracker)
 
 
 def output_json_lines(data: Dataset, formatter, cache_disabled):
@@ -662,13 +723,17 @@ def output_rich(data: Dataset, formatter, cache_disabled):
         show_header=True,
         header_style="bold blue",
         row_styles=[Style(), Style(color=Color.from_ansi(252))],
+        show_footer=True,
+        footer_style="bold blue",
     )
     table.box = box.MINIMAL
 
-    for col in data.output_columns:
-        table.add_column(col)
+    rows = list(data.get_rows_list("", formatter=formatter))
 
-    for row in data.get_rows_list("", formatter=formatter):
+    for col in data.output_columns:
+        table.add_column(col, footer="" if len(rows) < 15 else col)
+
+    for row in rows:
         table.add_row(*row)
 
     console.print(table)
@@ -742,6 +807,12 @@ if __name__ == "__main__":
         help="Export to HTML file.",
     )
 
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable verbose logging.",
+    )
     subparsers = parser.add_subparsers(required=True, dest="action_name")
 
     create_subparsers = [
@@ -749,12 +820,16 @@ if __name__ == "__main__":
         RPDataset,
         SPDataset,
         MRDataset,
+        PFClientDataset,
     ]
 
     for sp_class in create_subparsers:
         sp_class.add_subparser(subparsers)
 
     args = parser.parse_args()
+
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG)
 
     no_cache = args.no_cache or FORMAT_OPTS[args.format]["disable_cache"]
     if no_cache:
