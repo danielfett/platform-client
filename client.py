@@ -238,7 +238,7 @@ class Dataset:
                 try:
                     if eval(self.where, {}, row):
                         yield row
-                except TypeError:
+                except (TypeError, AttributeError):
                     pass
 
     def opportunistic_where_applied(self):
