@@ -23,7 +23,7 @@ See [credentials.example.yml](credentials.example.yml) for an example.
 
 ## Common Use Cases
 
- * Show all active RPs:  \
+ * Show all inactive RPs (by default, only active RPs are shown):  \
     `$ ./client.py sandbox.yml rps --where 'status=="inactive"'`
  * Show RPs containing 'test' in their name: \
     `$ ./client.py sandbox.yml rps --where '"test" in client_name.lower()'`
