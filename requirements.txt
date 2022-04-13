@@ -4,3 +4,4 @@ pyyaml
 requests_cache
 config_path
 dateparser
+cryptography
