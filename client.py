@@ -43,7 +43,7 @@ from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from rich import box
 from rich.color import Color
-from rich.console import Console, RenderGroup
+from rich.console import Console, Group
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.progress import Progress
@@ -367,7 +367,7 @@ class JWKSCustomType(CustomType):
             return None
 
     def get_rich(self):
-        out = RenderGroup()
+        out = Group()
 
         for c in self.certs:
             if c is None:
