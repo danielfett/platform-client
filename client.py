@@ -819,7 +819,7 @@ FORMAT_OPTS = {
 
 if __name__ == "__main__":
     configpath = ConfigPath("yes", "platform-client", "")
-    requests_cache.core.install_cache(
+    requests_cache.patcher.install_cache(
         cache_name=str(configpath.saveFilePath(mkdir=True)),
         fast_save=True,
         expire_after=CACHE_LIFETIME,
@@ -871,7 +871,7 @@ if __name__ == "__main__":
 
     no_cache = args.no_cache or FORMAT_OPTS[args.format]["disable_cache"]
     if no_cache:
-        requests_cache.core.clear()
+        requests_cache.clear()
 
     with console.status("Connecting to yes® platform ...") as status:
         api = YesPlatformAPI(**load(args.credentials_file.read(), Loader=SafeLoader))
@@ -887,4 +887,4 @@ if __name__ == "__main__":
         console.save_html(args.export)
         console.print(f"[red]Output exported to {args.export}.")
 
-    requests_cache.core.remove_expired_responses()
+    requests_cache.remove_expired_responses()
